@@ -65,7 +65,7 @@ jobs:
           fi
 
       - name: Refresh
-        run: python -u subscribe/collect.py --all --refresh --overwrite --skip
+        run: python -u subscribe/collect.py --all --overwrite --refresh > /proc/1/fd/1 2>/proc/1/fd/2
 
       - name: Timestamp
         run: date
