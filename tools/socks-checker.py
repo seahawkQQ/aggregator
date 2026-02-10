@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
+import yaml
 from aiohttp_socks import ProxyConnector
 
 COUNTRY_NAME_ZH = {
@@ -662,8 +663,8 @@ class ProxyChecker:
             return f"{base} [{company_name}]".strip()
         return base
 
-    def _renumber_output_file(self, output_file: str, output_format: str, digits: int = 2) -> None:
-        proxies = read_proxies_from_file(output_file)
+    def _convert(self, input_file: str, output_file: str, output_format: str, digits: int = 2) -> None:
+        proxies = read_proxies(input_file)
         if not proxies:
             return
 
@@ -686,8 +687,16 @@ class ProxyChecker:
             info.remark = name
             groups.setdefault(name, []).append(info)
 
+        # 按代理名称升序排序
+        names = sorted(list(groups.keys()))
+
         lines: List[str] = []
-        for name, nodes in groups.items():
+        for name in names:
+            nodes = groups.get(name, [])
+
+            # 按类型排序
+            nodes.sort(key=lambda x: x.protocol)
+
             width = max(digits, len(str(len(nodes))))
             for index, info in enumerate(nodes):
                 content = f"{name} {str(index + 1).zfill(width)}"
@@ -803,6 +812,14 @@ class ProxyChecker:
                     else:
                         stats["failed"] += 1
 
+                    completed = stats["success"] + stats["failed"]
+                    if completed % 100 == 0 or completed == stats["total"]:
+                        remaining = stats["total"] - completed
+                        progress = (completed / stats["total"] * 100) if stats["total"] else 0.0
+                        print(
+                            f"💡 测试进度: {progress:.1f}% | 总数: {stats['total']} | 已完成: {completed} | 待测试: {remaining} | 可用: {stats['success']}"
+                        )
+
                 return result
 
         # 并发执行测试
@@ -829,7 +846,7 @@ class ProxyChecker:
         }
 
         if output_file and stats["success"] > 0:
-            self._renumber_output_file(output_file, output_format)
+            self._convert(output_file, output_file, output_format)
 
         if output_file:
             self.results = []
@@ -886,140 +903,105 @@ class ProxyChecker:
         print(f"\n结果已保存到: {output_file}")
 
 
-def read_proxies_from_file(file_path: str) -> List[str]:
+def read_proxies(filepath: str) -> List[str]:
     """
     从文件读取代理列表
 
     Args:
-        file_path: 文件路径
+        filepath: 文件路径
 
     Returns:
         代理列表
     """
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
 
-        def strip_quotes(value: str) -> str:
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-                return value[1:-1]
-            return value
+        def _build_proxy(entry: Dict) -> Optional[str]:
+            host = entry.get("server") or entry.get("host")
+            port = entry.get("port")
+            if not host or port is None:
+                return None
 
-        def split_inline_items(text: str) -> List[str]:
-            buffers, items = [], []
-            in_quote = None
-            escape = False
-
-            for c in text:
-                if in_quote:
-                    if escape:
-                        buffers.append(c)
-                        escape = False
-                        continue
-                    if c == "\\":
-                        escape = True
-                        buffers.append(c)
-                        continue
-                    if c == in_quote:
-                        in_quote = None
-                    buffers.append(c)
-                    continue
-                if c in ("'", '"'):
-                    in_quote = c
-                    buffers.append(c)
-                    continue
-                if c == ",":
-                    item = "".join(buffers).strip()
-                    if item:
-                        items.append(item)
-                    buffers = []
-                    continue
-                buffers.append(c)
-
-            tail = "".join(buffers).strip()
-            if tail:
-                items.append(tail)
-            return items
-
-        def parse_inline_map(text: str) -> Dict[str, str]:
-            data: Dict[str, str] = {}
-            for item in split_inline_items(text):
-                if ":" not in item:
-                    continue
-                key, value = item.split(":", 1)
-                data[key.strip()] = strip_quotes(value.strip())
-            return data
-
-        def parse_yaml_entries(file_lines: List[str]) -> List[Dict[str, str]]:
-            entries: List[Dict[str, str]] = []
-            in_proxies = False
-            current: Optional[Dict[str, str]] = None
-            for raw in file_lines:
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("proxies:"):
-                    in_proxies = True
-                    continue
-                if not in_proxies:
-                    continue
-                if line.startswith("- "):
-                    if current:
-                        entries.append(current)
-                        current = None
-                    rest = line[2:].strip()
-                    if rest.startswith("{") and rest.endswith("}"):
-                        entries.append(parse_inline_map(rest[1:-1]))
-                    else:
-                        current = {}
-                        if ":" in rest:
-                            key, value = rest.split(":", 1)
-                            current[key.strip()] = strip_quotes(value.strip())
-                else:
-                    if current and ":" in line:
-                        key, value = line.split(":", 1)
-                        current[key.strip()] = strip_quotes(value.strip())
-            if current:
-                entries.append(current)
-            return entries
-
-        def yaml_entries_to_proxies(entries: List[Dict[str, str]]) -> List[str]:
-            proxies: List[str] = []
-            for entry in entries:
-                host = entry.get("server") or entry.get("host")
-                port_value = entry.get("port")
-                if not host or port_value is None:
-                    continue
+            if not type(port) != int:
                 try:
-                    port = int(str(port_value))
-                except ValueError:
-                    continue
-                protocol = (entry.get("type") or "socks5").strip()
-                if protocol == "https":
-                    protocol = "http"
-                username = entry.get("username") or ""
-                password = entry.get("password") or ""
-                name = entry.get("name") or ""
-                auth = ""
-                if username or password:
-                    auth = f"{username}:{password}@"
-                proxy = f"{protocol}://{auth}{host}:{port}"
-                if name:
-                    proxy = f"{proxy}#{name}"
-                proxies.append(proxy)
-            return proxies
+                    port = int(str(port).strip())
+                except (TypeError, ValueError):
+                    return None
 
-        if any(line.strip().startswith("proxies:") for line in lines):
-            entries = parse_yaml_entries(lines)
-            clash_proxies = yaml_entries_to_proxies(entries)
-            if clash_proxies:
-                return clash_proxies
+            protocol = str(entry.get("type") or "socks5").strip().lower()
+            if protocol == "https":
+                protocol = "http"
+            elif protocol == "socks":
+                protocol = "socks5"
 
-        proxies = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+            username = entry.get("username") or ""
+            password = entry.get("password") or ""
+            name = entry.get("name") or ""
+
+            auth = ""
+            if username or password:
+                auth = f"{username}:{password}@"
+            proxy = f"{protocol}://{auth}{host}:{port}"
+            if name:
+                proxy = f"{proxy}#{name}"
+            return proxy
+
+        def _load_proxies(data) -> List[str]:
+            if data is None:
+                return []
+
+            if isinstance(data, dict):
+                if "proxies" in data:
+                    return _load_proxies(data.get("proxies"))
+
+                return []
+
+            if isinstance(data, list):
+                proxies: List[str] = []
+                for item in data:
+                    if isinstance(item, str):
+                        value = item.strip()
+                        if value and not value.startswith("#"):
+                            proxies.append(value)
+                        continue
+
+                    if isinstance(item, dict):
+                        proxy = _build_proxy(item)
+                        if proxy:
+                            proxies.append(proxy)
+                return proxies
+
+            if isinstance(data, str):
+                value = data.strip()
+                if "\n" in value or "\r" in value:
+                    return []
+                if value and "://" in value:
+                    return [value]
+            return []
+
+        def _parse_yaml(text: str) -> Tuple[Optional[List[str]], Optional[object]]:
+            try:
+                data = yaml.safe_load(text)
+            except yaml.YAMLError:
+                return None, None
+
+            return _load_proxies(data), data
+
+        if filepath.lower().endswith((".yaml", ".yml")) or "proxies:" in content:
+            proxies, data = _parse_yaml(content)
+            if proxies:
+                return proxies
+
+            if data is not None and not isinstance(data, str):
+                print(f"错误：Yaml 格式文件不正确 - {filepath}")
+                return []
+
+        lines = content.splitlines()
+        proxies = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
         return proxies
     except FileNotFoundError:
-        print(f"错误: 文件不存在 - {file_path}")
+        print(f"错误: 文件不存在 - {filepath}")
         sys.exit(1)
     except Exception as e:
         print(f"错误: 读取文件失败 - {e}")
@@ -1112,7 +1094,7 @@ async def main():
     # 获取代理列表
     proxies = []
     if args.file:
-        proxies = read_proxies_from_file(args.file)
+        proxies = read_proxies(args.file)
     elif args.proxy:
         proxies = [args.proxy]
     else:
