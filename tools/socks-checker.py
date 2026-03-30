@@ -19,7 +19,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import aiohttp
 import yaml
@@ -592,8 +592,13 @@ class IP2LocationLibrary(IPLibrary):
     name = "ip2location"
 
     def build_remark(self, data: Dict, include_asn_name: bool) -> str:
+        as_info = data.get("as_info") or {}
+
         usage_type = (data.get("usage_type") or "").strip().lower()
-        label = "家宽" if (usage_type.startswith("isp") or usage_type == "mob") else ""
+        as_usage_type = ((as_info.get("as_usage_type") if isinstance(as_info, dict) else "") or "").strip().lower()
+
+        check = lambda usage: usage.startswith("isp") or usage == "mob"
+        label = "家宽" if check(usage_type) and check(as_usage_type) else ""
 
         country_code = (data.get("country_code") or "").upper()
         country = (
@@ -604,10 +609,8 @@ class IP2LocationLibrary(IPLibrary):
         )
 
         provider = (data.get("as", "") or data.get("isp", "") or "").strip()
-        if not provider and "as_info" in data:
-            as_info = data.get("as_info", {})
-            if as_info and isinstance(as_info, dict):
-                provider = (as_info.get("as_name", "") or as_info.get("as_domain", "")).strip()
+        if not provider and as_info and isinstance(as_info, dict):
+            provider = (as_info.get("as_name", "") or as_info.get("as_domain", "")).strip()
         if not provider:
             provider = data.get("domain", "").strip() or ""
 
@@ -760,7 +763,7 @@ class ProxyChecker:
         解析代理字符串，支持自定义格式
 
         支持的格式占位符:
-        - {protocol}: 协议类型 (socks5/socks4/http等)
+        - {protocol}: 协议类型 (socks5/socks4/http/https等)
         - {username}: 用户名
         - {password}: 密码
         - {host}: 主机地址
@@ -802,10 +805,7 @@ class ProxyChecker:
                 prefix = f"socks5://{prefix}"
 
             result = urlparse(prefix)
-
             protocol = result.scheme or "socks5"
-            if protocol == "https":
-                protocol = "http"
 
             return ProxyInfo(
                 protocol=protocol,
@@ -892,9 +892,6 @@ class ProxyChecker:
             elif placeholder == "host":
                 host = value
 
-        if protocol == "https":
-            protocol = "http"
-
         return ProxyInfo(
             protocol=protocol,
             username=username,
@@ -910,20 +907,20 @@ class ProxyChecker:
         Test a single proxy with retries.
         """
         result = TestResult.from_proxy(proxy_info)
-
-        # Build proxy URL
-        if proxy_info.username and proxy_info.password:
-            proxy_url = (
-                f"{proxy_info.protocol}://{proxy_info.username}:{proxy_info.password}"
-                f"@{proxy_info.host}:{proxy_info.port}"
-            )
-        else:
-            proxy_url = f"{proxy_info.protocol}://{proxy_info.host}:{proxy_info.port}"
-
         start_time = datetime.now()
         try:
-            connector = ProxyConnector.from_url(proxy_url)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            protocol = (proxy_info.protocol or "").lower()
+            if protocol in ("http", "https"):
+                proxy_url = self._build_proxy_url(proxy_info, include_auth=False)
+                proxy_auth = self._build_proxy_auth(proxy_info)
+                connector = aiohttp.TCPConnector(ssl=False)
+                session = aiohttp.ClientSession(connector=connector, proxy=proxy_url, proxy_auth=proxy_auth)
+            else:
+                proxy_url = self._build_proxy_url(proxy_info, include_auth=True)
+                connector = ProxyConnector.from_url(proxy_url)
+                session = aiohttp.ClientSession(connector=connector)
+
+            async with session:
                 lookup = await self.ip_library.lookup(session, proxy_info, retries, self.timeout)
                 if not lookup.ip or not lookup.data:
                     result.error = lookup.error or f"Failed to get IP info from {self.ip_library.name}"
@@ -955,18 +952,37 @@ class ProxyChecker:
             return f"{base}#{remark}"
         return base
 
+    def _build_proxy_url(self, proxy_info: ProxyInfo, include_auth: bool) -> str:
+        auth = ""
+        if include_auth and (proxy_info.username or proxy_info.password):
+            username = quote(proxy_info.username or "", safe="")
+            password = quote(proxy_info.password or "", safe="")
+            auth = f"{username}:{password}@"
+
+        return f"{proxy_info.protocol}://{auth}{proxy_info.host}:{proxy_info.port}"
+
+    def _build_proxy_auth(self, proxy_info: ProxyInfo) -> Optional[aiohttp.BasicAuth]:
+        if not (proxy_info.username or proxy_info.password):
+            return None
+
+        return aiohttp.BasicAuth(proxy_info.username or "", proxy_info.password or "")
+
     def _yaml_quote(self, value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
 
     def _format_yaml_line(self, result: TestResult) -> str:
         name = result.remark or result.host
+        protocol = (result.protocol or "").lower()
+        clash_type = "http" if protocol == "https" else protocol
         parts = [
             f"name: {self._yaml_quote(name)}",
             f"server: {self._yaml_quote(result.host)}",
             f"port: {result.port}",
-            f"type: {self._yaml_quote(result.protocol)}",
+            f"type: {self._yaml_quote(clash_type)}",
         ]
+        if protocol == "https":
+            parts.append("tls: true")
         if result.username:
             parts.append(f"username: {self._yaml_quote(result.username)}")
         if result.password:
@@ -1250,8 +1266,8 @@ def read_proxies(filepath: str) -> List[str]:
                     return None
 
             protocol = str(entry.get("type") or "socks5").strip().lower()
-            if protocol == "https":
-                protocol = "http"
+            if protocol == "http" and entry.get("tls") is True:
+                protocol = "https"
             elif protocol == "socks":
                 protocol = "socks5"
 
@@ -1375,7 +1391,7 @@ async def main():
   %(prog)s -f proxies.txt --input-format "socks5://{host}:{port}:{username}:{password}"
 
 支持的格式占位符:
-  {protocol}  - 协议类型 (socks5/socks4/http等)
+  {protocol}  - 协议类型 (socks5/socks4/http/https等)
   {username}  - 用户名
   {password}  - 密码
   {host}      - 主机地址/IP
